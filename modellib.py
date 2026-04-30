@@ -6,6 +6,7 @@ from model.RSTR import RSTR
 from torch.utils.data import Dataset
 from numpy import load, ceil
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class DatasetPetMr_v2(Dataset):
     def __init__(self, filename, num_train, transform=None, target_transform=None, is3d=False, imgLD_flname = None,crop_factor = 0, allow_pickle=True):
         """
@@ -44,7 +45,6 @@ class DatasetPetMr_v2(Dataset):
         dset = load(self.filename[0]+self.filename[1]+str(index)+'.npy',allow_pickle=self.allow_pickle).item()
         
         sinoLD =  self.crop_sino(dset['sinoLD'])
-        sinoHD = self.crop_sino(dset['sinoHD'])
         AN = self.crop_sino(dset['AN'])
         imgHD = self.crop_img(dset['imgHD'])
         mrImg = self.crop_img(dset['mrImg'])
@@ -74,7 +74,6 @@ class DatasetPetMr_v2(Dataset):
              imgLD_psf = 0
         if self.transform is not None:
             sinoLD = self.transform(sinoLD)
-            sinoHD = self.transform(sinoHD)
             AN = self.transform(AN)   
             if not np.isscalar(RS):
                  RS = self.transform(RS) 
@@ -88,7 +87,7 @@ class DatasetPetMr_v2(Dataset):
             if not np.isscalar(imgGT):
                  imgGT = self.target_transform(imgGT)
      #    return sinoLD, imgHD, AN, RS,imgLD, imgLD_psf, mrImg, counts, imgGT,index #simu return
-        return sinoLD, sinoHD,imgHD, AN, RS,imgLD, imgLD_psf, mrImg, counts, imgGT,index
+        return sinoLD,imgHD, AN, RS,imgLD, imgLD_psf, mrImg, counts, imgGT,index
  
 def train_test_split(dset, num_train, batch_size, test_size, valid_size=0, num_workers = 0, shuffle=True):
     from torch.utils.data.sampler import SubsetRandomSampler
@@ -196,14 +195,16 @@ def toNumpy(x):
 
 
 def zeroNanInfs(x):
-     from torch import is_tensor,isnan,isinf, Tensor,float
-     if is_tensor(x):
-          x.data[isnan(x)]= Tensor([0]).to('cuda:0',dtype=float)
-          x.data[isinf(x)]= Tensor([0]).to('cuda:0',dtype=float)
-     else:
-          x[np.isnan(x)]=0
-          x[np.isinf(x)]=0
-     return x
+    """Replace NaN and Inf with 0 in-place.  Works for tensors and numpy arrays."""
+    import torch
+    if torch.is_tensor(x):
+        # Use scalar 0 rather than Tensor([0]) to avoid device mismatches
+        x.data[torch.isnan(x)] = 0
+        x.data[torch.isinf(x)] = 0
+    else:
+        x[np.isnan(x)] = 0
+        x[np.isinf(x)] = 0
+    return x
 
 class dotstruct():
     def __setattr__(self, name, value):
@@ -229,13 +230,16 @@ def setOptions(arg,opt,trasnfer=True):
     return arg
 
 class TransEM(nn.Module):
-    def __init__(self, in_channels=1,is3d=False):
+    def __init__(self, in_channels=1, is3d=False):
         super(TransEM,self).__init__()
         self.regularize = RSTR(input_dim = in_channels, dim=96,input_resolution=(120,120),depth=1,num_heads=12,window_size=4,mlp_ratio= 2)
         self.gamma = nn.Parameter(torch.rand(1),requires_grad=True)
         self.is3d = is3d
         
-    def forward(self,PET,prompts,img=None,RS=None, AN=None, iSensImg = None, mrImg=None, niters = 10, nsubs=1, tof=False, psf=0,device ='cuda', crop_factor = 0):
+    def forward(self,PET,prompts,img=None,RS=None, AN=None, 
+                iSensImg = None, mrImg=None, 
+                niters = 10, nsubs=1, tof=False, psf=0,device =device, 
+                crop_factor = 0):
          # e.g. crop_factor = 0.667
          
          batch_size = prompts.shape[0]
@@ -273,7 +277,8 @@ class TransEM(nn.Module):
               mrImg = Crop(mrImg)
          imgt = toTorch(img)
          
-         for i in range(niters):
+         for _ in range(niters):
+             imgt = imgt.detach()  # uncomment to limit autograd graph to one outer iteration (niters×nsubs RSTR calls chain otherwise)
              for s in range(nsubs):
                    if self.is3d:
                         img_em = img*PET.forwardDivideBackwardBatch3D(img, prompts, RS, AN, nsubs, s, psf)*iSensImg[:,s,:,:,:]
@@ -302,7 +307,7 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
     g.niters = 10
     g.nsubs = 6
     g.lr = 0.001
-    g.epochs = 100
+    g.epochs = 10
     g.in_channels = 1
     g.save_dir = os.getcwd()
     g.model_name = 'TransEM-pm-01'
@@ -311,7 +316,7 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
     g.save_from_epoch = None
     g.crop_factor = 0.3
     g.do_validation = True
-    g.device = torch.device('cuda:0')
+    g.device = torch.device(device)
     g.mr_scale = 5
 
     g = setOptions(g,opts)
@@ -331,7 +336,7 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
     for e in range(g.epochs):
          
          running_loss = 0
-         for sinoLD, sinoHD,imgHD, AN, _,_, _, mrImg, _, _,index in train_loader: 
+         for sinoLD,imgHD, AN, _,_, _, mrImg, _, _,index in train_loader: 
              AN=toNumpy(AN)
              RS = None
              sinoLD=toNumpy(sinoLD)
@@ -359,7 +364,7 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
                  valid_loss = 0
                  with torch.no_grad():
                      model.eval()
-                     for sinoLD, sinoHD,imgHD, AN, _,_, _, mrImg, _, _,index in valid_loader:
+                     for sinoLD,imgHD, AN, _,_, _, mrImg, _, _,index in valid_loader:
                          AN=toNumpy(AN)
                          RS = None
                          sinoLD=toNumpy(sinoLD)
@@ -384,8 +389,9 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
                   
                   checkpoint = g.as_dict()
                   torch.save(checkpoint,g.save_dir+g.model_name+'-epo-'+str(e)+'.pth')
-
-             torch.cuda.empty_cache()
+             # TODO:change to if device is cuda, then empty cache
+             if device.type == 'cuda':
+                 torch.cuda.empty_cache()
              output_file = open('{}/loss.txt'.format(g.save_dir), 'a')
              output_file.write(output_data)
              output_file.close()
@@ -402,17 +408,18 @@ def Trainer(PET, model, opts, train_loader, valid_loader=None):
     plt.show()
  
              
-def Test(dl_model_flname, PET, sinoLD, AN, mrImg, niters=None, nsubs = None, device='cuda:0'):
+def Test(dl_model_flname, PET, sinoLD, AN, mrImg, niters=None, nsubs=None, device=None):
 
+    if device is None:
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     toNumpy = lambda x: x.detach().cpu().numpy().astype('float32')
 
     g = torch.load(dl_model_flname, map_location=torch.device(device))
     
-    model = TransEM(g['depth'], g['in_channels'], g['is3d']).to(device)
+    model = TransEM(g['in_channels'], g['is3d']).to(device)
     model.load_state_dict(g['state_dict'])
     
     AN=toNumpy(AN)
-    RS = None
     sinoLD = toNumpy(sinoLD)
 
     if g['in_channels']==2:

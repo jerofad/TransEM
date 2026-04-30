@@ -1517,6 +1517,7 @@ class BuildGeometry:
          else:
               imgOut = img
          return imgOut
+    
     def uncrop_img(self,img):
          W = self.sinogram.nRadialBins_orig
          i = (W - img.shape[1])//2 
